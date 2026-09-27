@@ -256,13 +256,14 @@ async def analyze_prompt_combined(
     regex_result = analyze_prompt(prompt_text, sanitize=sanitize)
 
     # Stage 2: local ML model (always runs — fast, no API cost)
+    # Runs in a worker thread so the event loop is never blocked during inference.
     ml_prediction = {}
     ml_risk_score = 0.0
     ml_decision = "allow"
     ml_categories: list[str] = []
     try:
-        from guardion_ai_model.inference import analyze_prompt as ml_analyze
-        ml_prediction = ml_analyze(prompt_text)
+        from guardion_ai_model.inference import analyze_prompt_async as ml_analyze_async
+        ml_prediction = await ml_analyze_async(prompt_text)
         prediction = ml_prediction.get("prediction", "safe")
         confidence = ml_prediction.get("confidence", 0.0)
 

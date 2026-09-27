@@ -8,18 +8,30 @@ The Gemini call uses the same five security categories as the local model:
   safe | pii_leak | credential_leak | financial_data | secret_code
 
 Output includes a combined decision (ALLOW / WARN / BLOCK).
+
+Uses the modern `google-genai` async SDK with:
+  - thinking_budget=0 → no hidden thinking tokens → fast, consistent responses
+  - JSON response mode + schema → calibrated scores that always parse
+  - temperature=0 → reproducible classification precision
 """
 
 import json
 import re
 import asyncio
+import logging
 import sys
 import os
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from guardion_ai_model.inference import analyze_prompt as local_analyze
+
+logger = logging.getLogger("guardion.gemini_compare")
+
+# The five security categories (mirrors the local ML model)
+CATEGORIES = ["safe", "pii_leak", "credential_leak", "financial_data", "secret_code"]
 
 # Import shared cache & rate limiter (works when running inside the backend)
 try:
@@ -31,19 +43,22 @@ except ImportError:
 
 # ──────────────────── Gemini Configuration ────────────────────
 
-_configured = False
+_client: genai.Client | None = None
+CALL_TIMEOUT_SECONDS = 30
+# Thinking support by family: 2.5 accepts budget=0; 3.x rejects it (keep default);
+# -latest aliases resolve server-side, so run them with default thinking.
+_THINKING_OFF_MODELS = ("gemini-2.5",)
 
 
-def _ensure_gemini_configured(api_key: str) -> bool:
-    """Configure the Gemini SDK with the provided API key."""
-    global _configured
-    if _configured:
-        return True
+def _ensure_client(api_key: str) -> genai.Client | None:
+    """Create the Gemini client once. Returns None if no valid key is present."""
+    global _client
+    if _client is not None:
+        return _client
     if api_key and api_key != "your_gemini_api_key_here":
-        genai.configure(api_key=api_key)
-        _configured = True
-        return True
-    return False
+        _client = genai.Client(api_key=api_key)
+        return _client
+    return None
 
 
 # ──────────────────── Gemini Prompt Classification ────────────────────
@@ -75,6 +90,27 @@ Respond with ONLY valid JSON (no markdown):
 User prompt:
 \"\"\"{prompt}\"\"\"
 """
+
+# Enforced JSON schema → the API itself validates the output shape
+CLASSIFICATION_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "prediction": {"type": "string", "enum": ["safe", "pii_leak", "credential_leak", "financial_data", "secret_code"]},
+        "confidence": {"type": "number"},
+        "all_scores": {
+            "type": "object",
+            "properties": {
+                "safe": {"type": "number"},
+                "pii_leak": {"type": "number"},
+                "credential_leak": {"type": "number"},
+                "financial_data": {"type": "number"},
+                "secret_code": {"type": "number"},
+            },
+        },
+        "explanation": {"type": "string"},
+    },
+    "required": ["prediction", "confidence", "all_scores", "explanation"],
+}
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -108,7 +144,7 @@ async def gemini_classify(prompt_text: str, api_key: str) -> dict:
         }
         On failure, returns a fallback dict with "error" key.
     """
-    if not _ensure_gemini_configured(api_key):
+    if _ensure_client(api_key) is None:
         return {
             "prediction": "unknown",
             "confidence": 0.0,
@@ -138,8 +174,8 @@ async def gemini_classify(prompt_text: str, api_key: str) -> dict:
         model_name = settings.GEMINI_MODEL
         fallback_models = settings.GEMINI_FALLBACK_MODELS
     except ImportError:
-        model_name = "gemini-2.5-flash-lite"
-        fallback_models = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemma-3-4b-it"]
+        model_name = "gemini-2.5-flash"
+        fallback_models = ["gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-flash-latest"]
 
     # Build ordered model list: primary first, then fallbacks (deduped)
     models_to_try = [model_name] + [m for m in fallback_models if m != model_name]
@@ -152,37 +188,58 @@ async def gemini_classify(prompt_text: str, api_key: str) -> dict:
     last_error = None
     for try_model in models_to_try:
         try:
-            model = genai.GenerativeModel(
-                try_model,
-                generation_config=genai.GenerationConfig(
-                    temperature=0.3,
-                    max_output_tokens=1024,
+            # Build config adapted to the model family: JSON mode + no thinking
+            # on 2.5+/3 models; plain text mode for Gemma (no JSON-mime support).
+            config_kwargs: dict = {
+                "temperature": 0.0,  # deterministic classification → reproducible precision
+                "max_output_tokens": 1024,
+            }
+            if try_model.startswith("gemini"):
+                config_kwargs["response_mime_type"] = "application/json"
+                config_kwargs["response_schema"] = CLASSIFICATION_SCHEMA
+                if try_model.startswith(_THINKING_OFF_MODELS):
+                    config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+            config = types.GenerateContentConfig(**config_kwargs)
+
+            # Async call with a hard timeout — a slow model never stalls the request
+            response = await asyncio.wait_for(
+                _client.aio.models.generate_content(
+                    model=try_model,
+                    contents=classification_input,
+                    config=config,
                 ),
+                timeout=CALL_TIMEOUT_SECONDS,
             )
 
-            # Run sync call in executor to avoid blocking the event loop
-            import concurrent.futures
-            loop = asyncio.get_event_loop()
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                response = await loop.run_in_executor(
-                    pool,
-                    lambda m=model: m.generate_content(classification_input),
-                )
-
             # If we get here, the call succeeded — parse the result
-            result = _extract_json(response.text)
+            result = _extract_json(response.text or "")
             if result and "prediction" in result:
                 # Parse all_scores if Gemini returned them, otherwise synthesize
                 all_scores = result.get("all_scores", {})
                 if not all_scores or not isinstance(all_scores, dict):
                     pred = result["prediction"]
-                    all_scores = {c: 0.01 for c in ["safe", "pii_leak", "credential_leak", "financial_data", "secret_code"]}
+                    all_scores = {c: 0.01 for c in CATEGORIES}
                     all_scores[pred] = float(result.get("confidence", 0.8))
                 else:
                     all_scores = {k: float(v) for k, v in all_scores.items()}
                     total = sum(all_scores.values())
                     if total > 0 and abs(total - 1.0) > 0.05:
                         all_scores = {k: round(v / total, 4) for k, v in all_scores.items()}
+
+                # Normalize: clamp to [0,1] and re-normalize so scores sum to 1.0
+                all_scores = {
+                    k: max(0.0, min(1.0, v)) for k, v in all_scores.items()
+                    if isinstance(v, (int, float))
+                }
+                if all_scores:
+                    total = sum(all_scores.values())
+                    if total > 0:
+                        all_scores = {k: round(v / total, 4) for k, v in all_scores.items()}
+                else:
+                    pred = result["prediction"]
+                    conf = float(result.get("confidence", 0.8))
+                    all_scores = {c: round((1 - conf) / 4, 4) for c in CATEGORIES}
+                    all_scores[pred] = round(conf, 4)
 
                 all_scores = {k: round(v, 4) for k, v in all_scores.items()}
                 confidence = max(all_scores.values()) if all_scores else float(result.get("confidence", 0.0))
@@ -196,6 +253,7 @@ async def gemini_classify(prompt_text: str, api_key: str) -> dict:
                 }
                 if _HAS_CACHE:
                     gemini_cache.put(prompt_text, success_dict, prefix="classify:")
+                    gemini_rate_limiter.record_success()
                 return success_dict
 
             return {
@@ -206,6 +264,10 @@ async def gemini_classify(prompt_text: str, api_key: str) -> dict:
                 "model_used": try_model,
             }
 
+        except asyncio.TimeoutError:
+            logger.warning(f"Gemini model {try_model} timed out, trying next...")
+            last_error = "timeout"
+            continue
         except Exception as model_err:
             error_msg = str(model_err)
             if "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
@@ -218,12 +280,16 @@ async def gemini_classify(prompt_text: str, api_key: str) -> dict:
 
     # All models failed
     error_msg = str(last_error) if last_error else "Unknown error"
+    if _HAS_CACHE:
+        gemini_rate_limiter.record_failure()
     if "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
         explanation = f"All Gemini models quota exhausted ({', '.join(models_to_try)}). Try again later."
         if _HAS_CACHE:
             gemini_rate_limiter.mark_quota_exhausted()
     elif "PERMISSION_DENIED" in error_msg or "API key" in error_msg:
         explanation = "Gemini API key is invalid or expired."
+    elif error_msg == "timeout":
+        explanation = f"All Gemini models timed out ({', '.join(models_to_try)})."
     else:
         explanation = f"Gemini API error: {error_msg[:200]}"
 
@@ -286,8 +352,8 @@ async def compare_analysis(prompt_text: str, api_key: str) -> dict:
             "agreement": True
         }
     """
-    # Run local model (synchronous, fast)
-    local_result = local_analyze(prompt_text)
+    # Run local model (in a thread so the event loop is never blocked)
+    local_result = await asyncio.to_thread(local_analyze, prompt_text)
 
     # Run Gemini (async)
     gemini_result = await gemini_classify(prompt_text, api_key)

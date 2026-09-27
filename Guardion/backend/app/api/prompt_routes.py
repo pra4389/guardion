@@ -44,6 +44,7 @@ async def quota_status():
             "calls_remaining": gemini_rate_limiter.calls_remaining,
             "max_calls_per_minute": gemini_rate_limiter.max_calls,
             "in_cooldown": gemini_rate_limiter._quota_exhausted_until > __import__("time").time(),
+            "circuit_open": gemini_rate_limiter.circuit_open,
         },
         "cache": gemini_cache.stats,
     }

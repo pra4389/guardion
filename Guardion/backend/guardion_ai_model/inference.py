@@ -10,6 +10,7 @@ Usage:
 """
 
 import os
+import threading
 import numpy as np
 import joblib
 from sentence_transformers import SentenceTransformer
@@ -27,14 +28,19 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 _embedding_model = None
 _classifier = None
 _label_encoder = None
+_load_lock = threading.Lock()  # prevent concurrent double-loading (startup warmup + first request)
 
 
 def _load_models():
-    """Load the sentence-transformer, classifier, and label encoder into memory."""
+    """Load the sentence-transformer, classifier, and label encoder into memory (once)."""
     global _embedding_model, _classifier, _label_encoder
 
     if _classifier is not None:
         return  # Already loaded
+
+    with _load_lock:
+        if _classifier is not None:  # re-check after acquiring the lock
+            return
 
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(
@@ -101,6 +107,15 @@ def analyze_prompt(prompt_text: str) -> dict:
         "confidence": confidence,
         "all_scores": all_scores,
     }
+
+
+async def analyze_prompt_async(prompt_text: str) -> dict:
+    """
+    Async wrapper around analyze_prompt — runs the (CPU-bound) inference in a
+    thread so the FastAPI event loop is never blocked.
+    """
+    import asyncio
+    return await asyncio.get_event_loop().run_in_executor(None, analyze_prompt, prompt_text)
 
 
 def analyze_prompt_batch(prompts: list[str]) -> list[dict]:

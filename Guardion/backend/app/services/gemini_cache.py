@@ -24,6 +24,12 @@ CACHE_TTL_SECONDS = 3600      # Cache entries live for 1 hour
 MAX_CALLS_PER_MINUTE = 10     # Max Gemini API calls per minute (free tier: 15 RPM)
 QUOTA_COOLDOWN_SECONDS = 60   # Back off this long after a quota error
 
+# Circuit breaker: after N consecutive full-chain failures, stop calling the
+# API entirely for a cooldown. Requests then fall back to the local pipeline
+# instantly instead of hanging on a degraded/overloaded API.
+CIRCUIT_FAILURE_THRESHOLD = 3
+CIRCUIT_OPEN_SECONDS = 120
+
 
 # ──────────────────── LRU Cache with TTL ────────────────────
 
@@ -95,15 +101,42 @@ class RateLimiter:
         self._timestamps: list[float] = []
         self._lock = Lock()
         self._quota_exhausted_until: float = 0  # Timestamp when cooldown ends
+        self._consecutive_failures: int = 0
+        self._circuit_open_until: float = 0.0
 
     def mark_quota_exhausted(self):
         """Called when we get a RESOURCE_EXHAUSTED error. Backs off."""
         self._quota_exhausted_until = time.time() + QUOTA_COOLDOWN_SECONDS
         logger.warning(f"Gemini quota exhausted — cooling down for {QUOTA_COOLDOWN_SECONDS}s")
 
+    def record_success(self):
+        """A chain succeeded — reset the failure streak."""
+        self._consecutive_failures = 0
+
+    def record_failure(self):
+        """A full model chain failed — count it, maybe trip the circuit."""
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD:
+            self._circuit_open_until = time.time() + CIRCUIT_OPEN_SECONDS
+            self._consecutive_failures = 0
+            logger.warning(
+                f"Gemini circuit OPENED for {CIRCUIT_OPEN_SECONDS}s after "
+                f"{CIRCUIT_FAILURE_THRESHOLD} consecutive failed chains — using local pipeline"
+            )
+
+    @property
+    def circuit_open(self) -> bool:
+        """True while the circuit breaker is tripped (API is failing consistently)."""
+        return time.time() < self._circuit_open_until
+
     def can_call(self) -> bool:
         """Check if we're allowed to make an API call right now."""
         now = time.time()
+
+        # Respect circuit breaker
+        if now < self._circuit_open_until:
+            logger.debug("Rate limiter: circuit open, using local fallback")
+            return False
 
         # Respect quota cooldown
         if now < self._quota_exhausted_until:
@@ -123,7 +156,7 @@ class RateLimiter:
     def calls_remaining(self) -> int:
         """How many calls can still be made in the current window."""
         now = time.time()
-        if now < self._quota_exhausted_until:
+        if now < self._quota_exhausted_until or now < self._circuit_open_until:
             return 0
         with self._lock:
             active = [t for t in self._timestamps if now - t < self.window]

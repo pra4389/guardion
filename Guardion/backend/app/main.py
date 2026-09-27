@@ -68,9 +68,26 @@ app.include_router(code_scan_router)
 
 @app.on_event("startup")
 async def startup():
-    """Initialize MongoDB on server start."""
+    """Initialize MongoDB and preload the ML model on server start."""
     init_mongodb()
     print("Guardion backend started — MongoDB initialized")
+
+    # Warm up the local ML model in a background thread so the first
+    # /api/analyze_prompt request doesn't pay the ~2-5s cold-start cost.
+    # Loading once at startup also guarantees consistent single-request latency.
+    import asyncio
+
+    def _warm_ml_model():
+        try:
+            from guardion_ai_model.inference import analyze_prompt
+            analyze_prompt("warmup")
+            print("Guardion ML model preloaded — ready for instant inference")
+        except FileNotFoundError:
+            print("ML model not trained yet — run: python -m guardion_ai_model.train_model")
+        except Exception as e:
+            print(f"ML model warmup skipped: {e}")
+
+    asyncio.to_thread(_warm_ml_model)
 
 
 # ──────────────────── Health Check ────────────────────
