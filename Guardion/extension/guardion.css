@@ -104,6 +104,20 @@
   border: 1px solid rgba(239,68,68,0.3);
 }
 
+/* ML model verdict chip */
+.guardion-ml-chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  margin-left: 6px;
+  vertical-align: middle;
+  background: rgba(139,92,246,0.18);
+  color: #c4b5fd;
+  border: 1px solid rgba(139,92,246,0.35);
+}
+
 .guardion-categories {
   display: flex;
   flex-wrap: wrap;

@@ -87,7 +87,10 @@ async def startup():
         except Exception as e:
             print(f"ML model warmup skipped: {e}")
 
-    asyncio.to_thread(_warm_ml_model)
+    # asyncio.to_thread(...) alone creates a coroutine that is never scheduled
+    # (RuntimeWarning: never awaited) — the model would cold-load on the first
+    # request instead. create_task actually runs it.
+    asyncio.create_task(asyncio.to_thread(_warm_ml_model))
 
 
 # ──────────────────── Health Check ────────────────────

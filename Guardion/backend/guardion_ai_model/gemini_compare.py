@@ -61,6 +61,22 @@ def _ensure_client(api_key: str) -> genai.Client | None:
     return None
 
 
+def _is_transient_error(error_msg: str) -> bool:
+    """Google free-tier 503 'high demand' spikes are momentary — retry, don't give up."""
+    msg = error_msg.lower()
+    return any(
+        sig in msg
+        for sig in (
+            "503",
+            "unavailable",
+            "high demand",
+            "overloaded",
+            "internal error",
+            "500",
+        )
+    )
+
+
 # ──────────────────── Gemini Prompt Classification ────────────────────
 
 CLASSIFICATION_PROMPT = """You are a calibrated cybersecurity classifier. Assign probability scores to EACH category for the user prompt below.
@@ -273,6 +289,11 @@ async def gemini_classify(prompt_text: str, api_key: str) -> dict:
             if "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
                 last_error = model_err
                 continue  # Try next model
+            elif _is_transient_error(error_msg):
+                # 503/high-demand spikes are momentary — brief pause, then fail over
+                last_error = model_err
+                await asyncio.sleep(0.6)
+                continue
             else:
                 # Non-quota error — don't retry with other models
                 last_error = model_err
@@ -286,6 +307,8 @@ async def gemini_classify(prompt_text: str, api_key: str) -> dict:
         explanation = f"All Gemini models quota exhausted ({', '.join(models_to_try)}). Try again later."
         if _HAS_CACHE:
             gemini_rate_limiter.mark_quota_exhausted()
+    elif _is_transient_error(error_msg):
+        explanation = "Gemini is temporarily overloaded (high demand). The local ML verdict is shown instead — try Gemini again in a minute."
     elif "PERMISSION_DENIED" in error_msg or "API key" in error_msg:
         explanation = "Gemini API key is invalid or expired."
     elif error_msg == "timeout":

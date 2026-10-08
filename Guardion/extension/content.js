@@ -69,9 +69,7 @@
       if (isChatInput(el)) {
         const promptText = getPromptText();
         if (promptText && promptText.trim().length > 0) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          processPrompt(promptText, event);
+          submitPrompt(promptText, event);
         }
       }
     }
@@ -84,9 +82,7 @@
       if (isChatInput(el)) {
         const promptText = getPromptText();
         if (promptText && promptText.trim().length > 0) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          processPrompt(promptText, event);
+          submitPrompt(promptText, event);
         }
       }
     }
@@ -98,9 +94,7 @@
     if (form && form.tagName === "FORM") {
       const promptText = getPromptText();
       if (promptText && promptText.trim().length > 0) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        processPrompt(promptText, event);
+        submitPrompt(promptText, event);
       }
     }
   }
@@ -111,9 +105,7 @@
     if (button && isSendButton(button)) {
       const promptText = getPromptText();
       if (promptText && promptText.trim().length > 0) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        processPrompt(promptText, event);
+        submitPrompt(promptText, event);
       }
     }
   }
@@ -195,8 +187,90 @@
     return safe;
   }
 
+  // ──────── Shared submit decision (fast path vs full verdict) ────────
+  function submitPrompt(promptText, event) {
+    if (localPreScreen(promptText)) {
+      // Nothing suspicious locally → let the natural submit proceed instantly.
+      fastPathAllow(promptText);
+      return;
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    processPrompt(promptText, event);
+  }
+
+  // ──────── Instant local pre-screen ────────
+  // Conservative: ANY hit (regex or keyword) routes to the full backend
+  // verdict, so this can only fast-track genuinely clean, short prompts.
+  const RISKY_KEYWORDS = [
+    // secrets / credentials
+    "api_key", "apikey", "api key", "secret", "password", "passwd", "credential",
+    "token", "private key", "-----begin", "ghp_", "sk-", "mongodb://", "postgres://",
+    "mysql://", "redis://", ".env", ".pem", "ssh-rsa", "akia",
+    // pii / financial
+    "ssn", "social security", "credit card", "debit card", "card number", "cvv",
+    "date of birth", "passport", "salary", "bank account", "routing number",
+    "iban", "medical", "diagnos", "prescription",
+    // injection / exfiltration
+    "ignore previous", "ignore all", "disregard", "system prompt", "reveal",
+    "jailbreak", "developer mode", "act as", "pretend", "roleplay", "override",
+    "bypass", "exploit", "malware", "ransomware", "phishing", "keylogger",
+    "exfiltrat", "drop table",
+  ];
+
+  function localPreScreen(text) {
+    if (text.length > 500) return false;
+    const lower = text.toLowerCase();
+    for (const kw of RISKY_KEYWORDS) {
+      if (lower.includes(kw)) return false;
+    }
+    for (const cat of Object.keys(PATTERN_MAP)) {
+      for (const re of PATTERN_MAP[cat]) {
+        re.lastIndex = 0; // /g regexes keep state between .test() calls
+        if (re.test(text)) return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Fast path: local scan is clean, so release the prompt instantly instead of
+   * holding it for a network round-trip. The backend analysis still runs in the
+   * background for audit logging — and if it disagrees, warn the user post-send.
+   */
+  function fastPathAllow(promptText) {
+    isProcessing = true; // suppress duplicate keydown/beforeinput handling
+    setTimeout(() => {
+      isProcessing = false;
+    }, 150);
+
+    if (!chrome.runtime?.id) return;
+
+    chrome.runtime
+      .sendMessage({ action: "analyzePrompt", prompt: promptText, source: SITE })
+      .then((resp) => {
+        if (resp && !resp.error && (resp.decision === "block" || resp.decision === "warn")) {
+          showBanner({
+            type: "warn",
+            title: "Flagged after send",
+            message: "Guardion detected possible sensitive data in the message you just sent.",
+            risk: resp.risk_score,
+            categories: resp.detected_categories || [],
+            sanitizedPrompt: resp.sanitized_prompt,
+            originalText: promptText,
+            ml: resp.ml_prediction,
+          });
+        }
+      })
+      .catch(() => {});
+  }
+
   function getCategoryPatterns(category) {
-    const map = {
+    const map = PATTERN_MAP;
+    return map[category] || [];
+  }
+
+  const PATTERN_MAP = {
       api_key: [/\b[A-Za-z0-9_\-]{20,}\b/g],
       password: [/(?:password|passwd|pwd)\s*[:=]\s*\S+/gi],
       email: [/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g],
@@ -211,8 +285,6 @@
       database_url: [/(?:mongodb|postgres|mysql|redis):\/\/\S+/gi],
       internal_url: [/https?:\/\/(?:localhost|127\.0\.0\.1|10\.\d+|192\.168)\S*/g],
     };
-    return map[category] || [];
-  }
 
   // ──────── Escape HTML for safe rendering ────────
   function esc(str) {
@@ -259,6 +331,7 @@
             categories: cats,
             sanitizedPrompt: response.sanitized_prompt,
             originalText: promptText,
+            ml: response.ml_prediction,
           });
           break;
 
@@ -272,6 +345,7 @@
             sanitizedPrompt: response.sanitized_prompt,
             originalText: promptText,
             onProceed: () => allowPrompt(originalEvent),
+            ml: response.ml_prediction,
           });
           break;
 
@@ -343,6 +417,7 @@
       sanitizedPrompt,
       originalText,
       onProceed,
+      ml,
     } = opts;
 
     const banner = document.createElement("div");
@@ -354,6 +429,15 @@
     const riskBadge =
       riskPct != null
         ? `<span class="guardion-risk-badge">${riskPct}% risk</span>`
+        : "";
+
+    // ML model verdict chip (precision detail: which class + confidence)
+    const mlExcluded = ml == null || ["benign", "error", "unknown"].includes(ml.prediction);
+    const mlChip =
+      !mlExcluded && ml.prediction
+        ? `<span class="guardion-ml-chip">ML: ${esc(ml.prediction)}${
+            ml.confidence != null ? ` ${(ml.confidence * 100).toFixed(0)}%` : ""
+          }</span>`
         : "";
 
     // Category tags
@@ -371,7 +455,7 @@
       <div class="guardion-banner-content">
         ${SHIELD_SVG}
         <div class="guardion-message">
-          ${titleLabel}${esc(message)}${riskBadge}
+          ${titleLabel}${esc(message)}${riskBadge}${mlChip}
           ${catTags}
         </div>
         <div class="guardion-actions">

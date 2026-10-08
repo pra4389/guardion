@@ -348,7 +348,7 @@ Guardion/
 |-------|-----------|
 | **Backend** | Python 3.10+, FastAPI 0.104, Uvicorn, Pydantic 2.5 |
 | **Database** | MongoDB Atlas (PyMongo 4.6+) |
-| **AI Engine** | Google Gemini 2.5 Flash (google-generativeai SDK) |
+| **AI Engine** | Google Gemini 2.5 Flash (google-genai async SDK, thinking disabled, JSON mode) |
 | **ML Model** | sentence-transformers (all-MiniLM-L6-v2) + scikit-learn |
 | **Auth** | JWT (python-jose) + bcrypt (passlib) |
 | **Vuln APIs** | OSV API, NVD API v2.0 |

@@ -4,6 +4,7 @@ Handles prompt analysis requests from the Chrome extension.
 Includes ML model + Gemini side-by-side comparison endpoint.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -24,6 +25,14 @@ from app.db.mongodb import prompt_logs_collection
 logger = logging.getLogger("guardion.prompt_routes")
 
 router = APIRouter(prefix="/api", tags=["Prompt Security"])
+
+
+def _insert_prompt_log(doc: dict) -> None:
+    """Blocking pymongo insert, run inside a worker thread."""
+    try:
+        prompt_logs_collection().insert_one(doc)
+    except Exception as e:
+        logger.warning(f"MongoDB log failed: {e}")
 
 
 # ──────────────────── Quota / Economy Status ────────────────────
@@ -71,24 +80,27 @@ async def analyze_prompt_endpoint(
         request.prompt, sanitize=True, use_gemini=request.use_gemini
     )
 
-    # Log to MongoDB
-    try:
-        prompt_logs_collection().insert_one({
-            "user_id": current_user["_id"] if current_user else "anonymous",
-            "prompt_text": request.prompt[:2000],
+    # Log to MongoDB in a background thread — the sync pymongo driver would
+    # otherwise block the event loop (and every concurrent request) for the
+    # full Atlas round-trip. The response must not wait on audit logging.
+    user_id = current_user["_id"] if current_user else "anonymous"
+    doc = {
+        "user_id": user_id,
+        "prompt_text": request.prompt[:2000],
+        "risk_score": result.risk_score,
+        "decision": result.decision,
+        "detected_categories": result.detected_categories,
+        "source_site": request.source,
+        "ml_prediction": result.ml_prediction,
+        "result": {
+            "is_threat": result.decision in ("block", "warn"),
             "risk_score": result.risk_score,
-            "decision": result.decision,
-            "detected_categories": result.detected_categories,
-            "source_site": request.source,
-            "ml_prediction": result.ml_prediction,
-            "result": {
-                "is_threat": result.decision in ("block", "warn"),
-                "risk_score": result.risk_score,
-            },
-            "created_at": datetime.now(timezone.utc),
-        })
-    except Exception as e:
-        logger.warning(f"MongoDB log failed: {e}")
+        },
+        "created_at": datetime.now(timezone.utc),
+    }
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, lambda: _insert_prompt_log(doc))
+    future.add_done_callback(lambda f: f.exception() and logger.warning(f"MongoDB log failed: {f.exception()}"))
 
     return PromptAnalysisResponse(
         risk_score=result.risk_score,
